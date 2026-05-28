@@ -238,7 +238,7 @@ BEGIN
     FROM async.control; 
   END IF;
 END;    
-$$ LANGUAGE PLPGSQL;
+$$ LANGUAGE PLPGSQL SECURITY DEFINER;
 
 CREATE OR REPLACE FUNCTION async.finish(
   _task_ids BIGINT[],
@@ -382,7 +382,7 @@ BEGIN
   RETURN QUERY SELECT * FROM unnest(_tasks_out);
   
 END;
-$$ LANGUAGE PLPGSQL;
+$$ LANGUAGE PLPGSQL SECURITY DEFINER;
 
 CREATE OR REPLACE FUNCTION async.push_task(
   _task async.task_push_t,
@@ -442,7 +442,7 @@ BEGIN
       _request_latch_id;
   END IF;
 END;  
-$$ LANGUAGE PLPGSQL;
+$$ LANGUAGE PLPGSQL SECURITY DEFINER;
 
 
 /* Gets tasks with no routine.  When there is no query to call, the presumption 
