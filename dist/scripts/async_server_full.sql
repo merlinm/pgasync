@@ -1793,7 +1793,7 @@ BEGIN
     CONTINUE WHEN (SELECT task_id FROM async.worker WHERE slot = r.slot)
       IS DISTINCT FROM r.task_id;
 
-    /* It's time to clear the dblink result state.
+    /* It's time to clear the dblink result state if reaping connections.
      *
      * The dblink API requires two get result calls for async, one to get the 
      * result, one to reset the connection to read-ready state.  errors are 
@@ -1801,7 +1801,7 @@ BEGIN
      * thrown from a disconnect, so they are trapped and the task is presumed
      * failed.
      */
-    IF r.has_connection
+    IF r.has_connection AND _reaping
     THEN
       BEGIN
         PERFORM * FROM dblink_get_result(r.name, false) AS R(v TEXT);
