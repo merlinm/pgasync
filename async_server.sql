@@ -77,7 +77,7 @@ CREATE TABLE async.target
  
 CREATE TABLE async.task
 (
-  task_id BIGSERIAL PRIMARY KEY,
+  task_id BIGSERIAL,
   target TEXT REFERENCES async.target ON UPDATE CASCADE ON DELETE CASCADE,
   priority INT DEFAULT 0,
   entered TIMESTAMPTZ DEFAULT clock_timestamp(), 
@@ -114,8 +114,11 @@ CREATE TABLE async.task
   track_yielded BOOL,
 
   /* task has been delayed until after this time (if not null) */
-  eligible_when TIMESTAMPTZ
-);
+  eligible_when TIMESTAMPTZ,
+
+  /* yield, not finish, when task finishes */
+  yield_upon_finish BOOL
+) PARTITION BY LIST(processed);
 
 CREATE TYPE async.task_execution_state_t AS ENUM
 (
@@ -138,23 +141,24 @@ $$
 $$ LANGUAGE SQL IMMUTABLE;
 
 
+CREATE TABLE async.task_running PARTITION OF async.task FOR VALUES IN (NULL);
+CREATE UNIQUE INDEX ON async.task_running(task_id);
+
+CREATE TABLE async.task_complete PARTITION OF async.task DEFAULT;
+CREATE UNIQUE INDEX ON async.task_complete(task_id);
+
+
 /* supports fetching eligible tasks */
-CREATE INDEX ON async.task(concurrency_pool, priority, entered) 
-WHERE async.task_execution_state(task) = 'READY';
+CREATE INDEX ON async.task_running(concurrency_pool, priority, entered) 
+WHERE async.task_execution_state(task_running) = 'READY';
 
 /* look up expired tasks.  Times up qual is to prevent index being used for
  * any other purpose.
  */
-CREATE INDEX ON async.task(times_up)
+CREATE INDEX ON async.task_running(times_up)
   WHERE 
-    async.task_execution_state(task) IN('READY', 'RUNNING', 'YIELDED')
+    async.task_execution_state(task_running) IN('READY', 'RUNNING', 'YIELDED')
     AND times_up IS NOT NULL;
-
-/* supports cleaning up dead tasks on startup and other needs for 
- * processing unfinished tasks.
- */
-CREATE INDEX ON async.task(task_id)
-  WHERE async.task_execution_state(task) IN('READY', 'RUNNING', 'YIELDED');
     
 CREATE UNLOGGED TABLE async.worker
 (
@@ -344,7 +348,7 @@ BEGIN
   DELETE FROM async.concurrency_pool_tracker;
 
   PERFORM async.set_concurrency_pool_tracker(array_agg(concurrency_pool))
-  FROM async.task t
+  FROM async.task_running t
   WHERE 
     async.task_execution_state(t) = 'READY';
 
@@ -463,7 +467,7 @@ DECLARE
 BEGIN
   SET LOCAL enable_bitmapscan TO false;  
 
-  RETURN QUERY SELECT * FROM async.task t
+  RETURN QUERY SELECT * FROM async.task_running t
   WHERE
     _concurrency_pool = t.concurrency_pool
     AND async.task_execution_state(t) = 'READY'
@@ -516,7 +520,7 @@ CREATE OR REPLACE VIEW async.v_candidate_task AS
     FROM async.concurrency_pool_tracker pt
     CROSS JOIN async.control
     CROSS JOIN LATERAL (
-      SELECT * FROM async.task t
+      SELECT * FROM async.task_running t
       WHERE
         pt.concurrency_pool = t.concurrency_pool
         AND async.task_execution_state(t) = 'READY'
@@ -533,7 +537,7 @@ CREATE OR REPLACE VIEW async.v_candidate_task AS
   ORDER BY priority, entered
   LIMIT (SELECT g.workers - async.active_workers() FROM async.control g);
 
-/* experimental version to assing tasks to optimial slot all at once instead
+/* experimental version to assigning tasks to optimal slot all at once instead
  * of iterative loop.
  */
 CREATE OR REPLACE VIEW async.v_task_assigned_worker AS 
@@ -702,6 +706,7 @@ DECLARE
   _retry_counter INT DEFAULT 1;
 
   _tasks_ran JSONB DEFAULT '[]'::JSONB;
+  _test_connection BOOL DEFAULT false;
 BEGIN 
   did_stuff := false;
 
@@ -723,8 +728,8 @@ BEGIN
             ELSE ''
           END,
           r.connect_action));
-    
-      IF r.connect_action = 'keep'
+
+      IF r.connect_action = 'keep' AND _test_connection
       THEN
         BEGIN
           PERFORM * FROM dblink(r.name, 'SELECT 0') AS R(v INT);
@@ -839,7 +844,7 @@ BEGIN
     ),
     upd_task AS
     (
-      UPDATE async.task t SET 
+      UPDATE async.task_running t SET 
         consumed = timing,
         times_up = timing + COALESCE(
           manual_timeout, 
@@ -873,6 +878,7 @@ DECLARE
   c async.control;
   _max_retry_count INT DEFAULT 5;
   _retry_counter INT DEFAULT 1;
+  _test_connection BOOL DEFAULT false;
 BEGIN
   did_stuff := false;
 
@@ -914,7 +920,7 @@ BEGIN
           END,
           w.connect_action));
 
-      IF w.connect_action = 'keep'
+      IF w.connect_action = 'keep' AND _test_connection
       THEN
         BEGIN
           PERFORM * FROM dblink(w.name, 'SELECT 0') AS R(v INT);
@@ -984,7 +990,7 @@ BEGIN
         running_since = clock_timestamp()
       WHERE slot = w.slot;
 
-      UPDATE async.task SET
+      UPDATE async.task_running SET
         consumed = clock_timestamp(),
         times_up = 
           CASE 
@@ -1171,7 +1177,7 @@ $$ LANGUAGE PLPGSQL;
  * yielded pending some external action, or paused (which will express as a 
  * cancel but allow the task to be picked up again).
  *
- * This function may only be run from the asnyc main server itself.
+ * This function may only be run from the asnyc main server itself.async.finish_internal
  */
 CREATE OR REPLACE FUNCTION async.finish_internal(
   _task_ids BIGINT[],
@@ -1283,7 +1289,7 @@ BEGIN
      * thrown from a disconnect, so they are trapped and the task is presumed
      * failed.
      */
-    IF r.has_connection AND _reaping
+    IF r.has_connection AND _status IS DISTINCT FROM 'CANCELED'
     THEN
       BEGIN
         PERFORM * FROM dblink_get_result(r.name, false) AS R(v TEXT);
@@ -1371,15 +1377,23 @@ BEGIN
   /* mark task complete! */
   UPDATE async.task t SET
     processed = CASE 
-      WHEN q.status NOT IN ('YIELDED', 'PAUSED', 'DEFERRED') THEN _finish_time
+      WHEN 
+        q.status NOT IN ('YIELDED', 'PAUSED', 'DEFERRED') 
+        AND NOT (q.status = 'FINISHED' AND yield_upon_finish IS TRUE) THEN _finish_time
     END,
-    yielded = CASE WHEN q.status = 'YIELDED' THEN _finish_time END,
+    yielded = CASE 
+      WHEN q.status = 'YIELDED' OR (q.status = 'FINISHED' AND yield_upon_finish)
+      THEN _finish_time 
+    END,
     failed = q.status IN ('FAILED', 'CANCELED', 'TIMED_OUT'),
     processing_error = NULLIF(error_message, 'OK'),
     /* pause state is special; move task back into unprocessed state */
     consumed = CASE WHEN q.status NOT IN('PAUSED', 'DEFERRED') THEN consumed END,
-    finish_status = NULLIF(q.status, 'PAUSED'),
-    eligible_when = CASE WHEN q.status = 'DEFERRED' THEN now() + _duration END
+    finish_status = CASE WHEN
+      q.status = 'PAUSED' OR (q.status = 'FINISHED' AND yield_upon_finish)
+      THEN NULL ELSE q.status END,
+    eligible_when = CASE WHEN q.status = 'DEFERRED' THEN now() + _duration END,
+    yield_upon_finish = NULL
   FROM
   (
     SELECT 
@@ -1396,8 +1410,10 @@ BEGIN
       FROM jsonb_array_elements(_reaping_status) j 
     ) reap USING(task_id)
   ) q
-  WHERE t.task_id = q.task_id;
-  
+  WHERE 
+    t.task_id = q.task_id;
+
+  /* XXX: simplify and consolidate procesing of tracking. */
   WITH untrack AS
   (
     /* manage concurrency pool thread count. If finished, it will bet set false,
@@ -1461,7 +1477,7 @@ BEGIN
   FROM
   (
     SELECT array_agg(task_id) AS tasks
-    FROM async.task t
+    FROM async.task_running t
     WHERE 
       async.task_execution_state(t) IN('RUNNING', 'YIELDED')
       AND times_up < now()
@@ -1636,9 +1652,8 @@ BEGIN
           AND concurrency_pool NOT IN (SELECT target FROM async.target)
         )
     LOOP
-      PERFORM * FROM async.task t WHERE 
-        async.task_execution_state(t) IN ('READY', 'RUNNING', 'YIELDED')
-        AND t.concurrency_pool = cpt.concurrency_pool
+      PERFORM * FROM async.task_running t 
+      WHERE t.concurrency_pool = cpt.concurrency_pool
       LIMIT 1;
 
       IF FOUND 
@@ -1666,6 +1681,52 @@ END;
 $$ LANGUAGE PLPGSQL;
 
 
+CREATE OR REPLACE VIEW async.v_run_internal AS
+  WITH data AS MATERIALIZED
+  (
+    SELECT t.task_id AS deferred_task_id  
+    FROM async.task_running t
+    WHERE 
+      async.task_execution_state(t) = 'READY'
+      AND t.concurrency_pool = (SELECT self_target FROM async.control)
+
+  )
+  SELECT 
+    array_agg(task_id) AS task_ids, 
+    status,
+    error_message,
+    duration,
+    array_agg(deferred_task_id) AS deferred_task_ids
+  FROM 
+  (
+    SELECT 
+      deferred_task_id,
+      status,
+      error_message,
+      duration,
+      unnest(task_ids) AS task_id
+    FROM
+    (
+      SELECT 
+        t.task_id AS deferred_task_id,
+        d.*
+      FROM async.task_running t
+      CROSS JOIN LATERAL
+      (
+        SELECT * 
+        FROM jsonb_to_record(task_data) AS R(
+          task_ids BIGINT[],
+          status async.finish_status_t,
+          error_message TEXT,
+          duration INTERVAL)
+      ) d                 
+      WHERE 
+        async.task_execution_state(t) = 'READY'
+        AND t.concurrency_pool = (SELECT self_target FROM async.control)
+    ) q
+  )
+  GROUP BY 2, 3, 4;
+
 CREATE OR REPLACE FUNCTION async.run_internal() RETURNS BOOL AS
 $$
 DECLARE
@@ -1673,42 +1734,7 @@ DECLARE
   _did_stuff BOOL DEFAULT false;
 BEGIN
   /* optimized path for bulk task finish */
-  FOR r IN 
-    SELECT 
-      array_agg(task_id) AS task_ids, 
-      status,
-      error_message,
-      duration,
-      array_agg(deferred_task_id) AS deferred_task_ids
-    FROM 
-    (
-      SELECT 
-        deferred_task_id,
-        status,
-        error_message,
-        duration,
-        unnest(task_ids) AS task_id
-      FROM
-      (
-        SELECT 
-          t.task_id AS deferred_task_id,
-          d.*
-        FROM async.task t
-        CROSS JOIN LATERAL
-        (
-          SELECT * 
-          FROM jsonb_to_record(task_data) AS R(
-            task_ids BIGINT[],
-            status async.finish_status_t,
-            error_message TEXT,
-            duration INTERVAL)
-        ) d                 
-        WHERE 
-          async.task_execution_state(t) = 'READY'
-          AND t.concurrency_pool = (SELECT self_target FROM async.control)
-      ) q
-    )
-    GROUP BY 2, 3, 4
+  FOR r IN SELECT * FROM async.v_run_internal
   LOOP
     UPDATE async.task SET 
       consumed = now(),
@@ -2072,7 +2098,9 @@ BEGIN
     processed = now(),
     failed = true,
     processing_error = 'presumed failed due to async startup'
-  WHERE async.task_execution_state(t) IN('RUNNING', 'YIELDED'); 
+  WHERE 
+    async.task_execution_state(t) IN('RUNNING', 'YIELDED')
+    AND processed IS NULL; 
 
   SET LOCAL enable_seqscan TO DEFAULT;
   SET LOCAL enable_bitmapscan TO DEFAULT;
