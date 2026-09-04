@@ -754,6 +754,21 @@ $$
   SELECT debug_log FROM async.control;
 $$ LANGUAGE SQL IMMUTABLE;
 
+CREATE OR REPLACE FUNCTION async.replan() RETURNS TRIGGER AS
+$$
+BEGIN
+  DISCARD PLANS;
+  RETURN new;
+END;
+$$ LANGUAGE PLPGSQL;
+
+CREATE OR REPLACE TRIGGER on_async_control_update 
+  AFTER UPDATE ON async.control 
+  FOR EACH ROW WHEN (new.debug_log IS DISTINCT FROM old.debug_log)
+  EXECUTE PROCEDURE async.replan();
+
+
+
 CREATE OR REPLACE FUNCTION async.log(
   _level TEXT,
   _message TEXT) RETURNS VOID AS
@@ -2320,6 +2335,7 @@ BEGIN
   IF did_work
   THEN
     PERFORM async.log(
+      'DEBUG',
       format(
         'timing: total: %s since commit: %s reap: %s internal: %s run: %s routine: %s', 
         _total_time,
