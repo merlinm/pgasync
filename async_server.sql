@@ -712,7 +712,7 @@ $$ LANGUAGE PLPGSQL;
 
 
 /* experimental version to consolidate queries reading and writing */
-CREATE OR REPLACE FUNCTION async.run_tasks_experimental(did_stuff OUT BOOL) RETURNS BOOL AS
+CREATE OR REPLACE FUNCTION async.run_tasks(did_stuff OUT BOOL) RETURNS BOOL AS
 $$
 DECLARE
   r RECORD;
@@ -885,7 +885,7 @@ END;
 $$ LANGUAGE PLPGSQL;
 
 /* looks up eligible tasks and assigns to a worker */
-CREATE OR REPLACE FUNCTION async.run_tasks(did_stuff OUT BOOL) RETURNS BOOL AS
+CREATE OR REPLACE FUNCTION async.run_tasks_legacy(did_stuff OUT BOOL) RETURNS BOOL AS
 $$
 DECLARE
   r async.v_candidate_task;
@@ -1390,61 +1390,62 @@ BEGIN
   WHERE task_id = ANY(_task_ids);   
 
   /* mark task complete! */
-  UPDATE async.task t SET
-    processed = CASE 
-      WHEN 
-        q.status NOT IN ('YIELDED', 'PAUSED', 'DEFERRED') 
-        AND NOT (q.status = 'FINISHED' AND yield_upon_finish IS TRUE) THEN _finish_time
-    END,
-    yielded = CASE 
-      WHEN q.status = 'YIELDED' OR (q.status = 'FINISHED' AND yield_upon_finish)
-      THEN _finish_time 
-    END,
-    failed = q.status IN ('FAILED', 'CANCELED', 'TIMED_OUT'),
-    processing_error = NULLIF(error_message, 'OK'),
-    /* pause state is special; move task back into unprocessed state */
-    consumed = CASE WHEN q.status NOT IN('PAUSED', 'DEFERRED') THEN consumed END,
-    finish_status = CASE WHEN
-      q.status = 'PAUSED' OR (q.status = 'FINISHED' AND yield_upon_finish)
-      THEN NULL ELSE q.status END,
-    eligible_when = CASE WHEN q.status = 'DEFERRED' THEN now() + _duration END,
-    yield_upon_finish = NULL
-  FROM
+  WITH data AS
+  (
+    UPDATE async.task t SET
+      processed = CASE 
+        WHEN 
+          q.status NOT IN ('YIELDED', 'PAUSED', 'DEFERRED') 
+          AND NOT (q.status = 'FINISHED' AND yield_upon_finish IS TRUE) THEN _finish_time
+      END,
+      yielded = CASE 
+        WHEN q.status = 'YIELDED' OR (q.status = 'FINISHED' AND yield_upon_finish)
+        THEN _finish_time 
+      END,
+      failed = q.status IN ('FAILED', 'CANCELED', 'TIMED_OUT'),
+      processing_error = NULLIF(error_message, 'OK'),
+      /* pause state is special; move task back into unprocessed state */
+      consumed = CASE WHEN q.status NOT IN('PAUSED', 'DEFERRED') THEN consumed END,
+      finish_status = CASE WHEN
+        q.status = 'PAUSED' OR (q.status = 'FINISHED' AND yield_upon_finish)
+        THEN NULL ELSE q.status END,
+      eligible_when = CASE WHEN q.status = 'DEFERRED' THEN now() + _duration END,
+      yield_upon_finish = NULL
+    FROM
+    (
+      SELECT 
+        task_id,
+        COALESCE(reap.status, _status) AS status,
+        COALESCE(reap.error_message, _error_message) AS error_message
+      FROM unnest(_task_ids) task_id
+      LEFT JOIN 
+      (
+        SELECT
+          (j->>'task_id')::BIGINT AS task_id,
+          (j->>'status')::async.finish_status_t AS status,
+          (j->>'error_message') AS error_message
+        FROM jsonb_array_elements(_reaping_status) j 
+      ) reap USING(task_id)
+    ) q
+    WHERE t.task_id = q.task_id
+    RETURNING *
+  )
+  /* manage concurrency pool thread count. If finished, it will bet set false,
+   * reducing the tracker.
+   *
+   * Yielded task will reduce tracker if configured to do so.  Deferred
+   * tasks will reduce tracker.
+   */
+  UPDATE async.concurrency_pool_tracker p SET 
+    workers = workers - newly_finished
+  FROM 
   (
     SELECT 
-      task_id,
-      COALESCE(reap.status, _status) AS status,
-      COALESCE(reap.error_message, _error_message) AS error_message
-    FROM unnest(_task_ids) task_id
-    LEFT JOIN 
-    (
-      SELECT
-        (j->>'task_id')::BIGINT AS task_id,
-        (j->>'status')::async.finish_status_t AS status,
-        (j->>'error_message') AS error_message
-      FROM jsonb_array_elements(_reaping_status) j 
-    ) reap USING(task_id)
-  ) q
-  WHERE 
-    t.task_id = q.task_id;
-
-  /* XXX: simplify and consolidate procesing of tracking. */
-  WITH untrack AS
-  (
-    /* manage concurrency pool thread count. If finished, it will bet set false,
-     * reducing the tracker.
-     *
-     * Yielded task will reduce tracker if configured to do so.  Deferred
-     * tasks will reduce tracker.
-     */
-    UPDATE async.task t SET
-      tracked = CASE 
-        WHEN processed IS NOT NULL THEN false
-        WHEN finish_status = 'DEFERRED' THEN false 
-      END
+      concurrency_pool, 
+      count(*) AS newly_finished
+    FROM data
     WHERE 
-      task_id = any(_task_ids)
-      AND tracked
+      tracked
       AND (
         processed IS NOT NULL 
         OR (
@@ -1453,19 +1454,26 @@ BEGIN
         )
         OR finish_status = 'DEFERRED'
       )
-    RETURNING t.concurrency_pool   
-  ) 
-  UPDATE async.concurrency_pool_tracker p SET 
-    workers = workers - newly_finished
-  FROM 
-  (
-    SELECT 
-      concurrency_pool, 
-      count(*) AS newly_finished
-    FROM untrack
     GROUP BY 1
   ) q
   WHERE p.concurrency_pool = q.concurrency_pool;
+
+  /* untrack deferred and yielded tasks set not to be tacked.  It's tricky
+   * to do this without UPDATE RETURNING old/new, in the same statement that 
+   * does the main update in a way that allows for updating the concurrency 
+   * tracker, so we have to do it here.
+   */
+  UPDATE async.task t SET tracked = false
+  WHERE 
+    task_id = ANY(_task_ids)
+    AND 
+    (
+      (
+        yielded IS NOT NULL
+        AND NOT COALESCE(track_yielded, false)
+      )
+      OR finish_status = 'DEFERRED'
+    );
 END;
 $$ LANGUAGE PLPGSQL;
 
