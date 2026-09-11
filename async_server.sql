@@ -1968,7 +1968,7 @@ DECLARE
   _did_stuff BOOL DEFAULT FALSE;
 
   _back_off INTERVAL DEFAULT '30 seconds';
-  _stats_output_frequency INTERVAL DEFAULT '5 seconds';
+  _stats_output_frequency INTERVAL DEFAULT '1 second';
   _print_stats BOOL DEFAULT false;
   _print_stats_period FLOAT8;
 BEGIN
