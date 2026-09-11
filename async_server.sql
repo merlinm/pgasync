@@ -40,9 +40,9 @@ CREATE TABLE async.control
   running_since TIMESTAMPTZ,
   paused BOOL NOT NULL DEFAULT false,
   pid INT, /* pid of main background process */
-  busy_sleep FLOAT8 DEFAULT 0.01,
+  busy_sleep FLOAT8 DEFAULT 0.0001,
 
-  light_maintenance_sleep INTERVAL DEFAULT '5 minutes'::INTERVAL,
+  light_maintenance_sleep INTERVAL DEFAULT '1 minute'::INTERVAL,
   last_light_maintenance TIMESTAMPTZ,
 
   default_concurrency_pool_workers INT DEFAULT 4,
@@ -55,7 +55,7 @@ CREATE TABLE async.control
 
   version TEXT DEFAULT '1.0',
 
-  debug_log BOOL DEFAULT true
+  debug_log BOOL DEFAULT false
 
 );
 
@@ -239,7 +239,7 @@ $$ LANGUAGE SQL IMMUTABLE;
 CREATE OR REPLACE FUNCTION async.replan() RETURNS TRIGGER AS
 $$
 BEGIN
-  DISCARD PLANS;
+  PERFORM async.push_internal_query('DISCARD PLANS');
   RETURN new;
 END;
 $$ LANGUAGE PLPGSQL;
@@ -587,9 +587,7 @@ CREATE OR REPLACE VIEW async.v_task_assigned_worker AS
   (
     SELECT 
       w2.*,
-      row_number() OVER (
-        PARTITION BY w2.target
-        ORDER BY CASE WHEN w2.target IS NULL THEN 0 ELSE 1 END) idx2
+      row_number() OVER (ORDER BY w2.target NULLS FIRST) idx2
     FROM async.worker w2
     LEFT JOIN matched_target mt USING(slot)
     WHERE 
@@ -814,6 +812,8 @@ BEGIN
         'slot', r.slot,
         'pool', r.concurrency_pool,
         'timeout', r.default_timeout);
+
+      PERFORM nextval('task_counter');
 
     EXCEPTION WHEN OTHERS THEN
       PERFORM async.log(
@@ -1255,7 +1255,7 @@ BEGIN
     (
       SELECT unnest(_task_ids) task_id
     ) q
-    LEFT JOIN async.task t USING(task_id)
+    LEFT JOIN async.task_running t USING(task_id)
     LEFT JOIN async.worker w USING(task_id)
     LEFT JOIN
     (
@@ -1463,7 +1463,7 @@ BEGIN
    * does the main update in a way that allows for updating the concurrency 
    * tracker, so we have to do it here.
    */
-  UPDATE async.task t SET tracked = false
+  UPDATE async.task_running t SET tracked = false
   WHERE 
     task_id = ANY(_task_ids)
     AND 
@@ -1491,6 +1491,7 @@ DECLARE
   _reap_task_ids BIGINT[];
   _did_stuff BOOL DEFAULT false;
 BEGIN
+
   PERFORM async.finish_internal(
     tasks,
     'FAILED'::async.finish_status_t,
@@ -1519,7 +1520,7 @@ BEGIN
   (
     SELECT array_agg(t.task_id) AS task_ids
     FROM async.worker w 
-    LEFT JOIN async.task t USING(task_id)
+    LEFT JOIN async.task_running t USING(task_id)
     WHERE 
       w.task_id IS NOT NULL
       AND name = any(dblink_get_connections())
@@ -1666,6 +1667,14 @@ BEGIN
       '5 seconds')
     WHERE failed;
 
+    PERFORM async.log(
+      'WARNING',
+      format('Got %s when vaccuming async.concurrency_pool_tracker', response))
+    FROM async.query_with_timeout(
+      'VACUUM async.task_running',
+      '5 seconds')
+    WHERE failed;
+
     FOR cpt IN SELECT * FROM async.concurrency_pool_tracker 
       WHERE 
         workers < 0
@@ -1704,16 +1713,25 @@ END;
 $$ LANGUAGE PLPGSQL;
 
 
-CREATE OR REPLACE VIEW async.v_run_internal AS
-  WITH data AS MATERIALIZED
-  (
-    SELECT t.task_id AS deferred_task_id  
-    FROM async.task_running t
-    WHERE 
-      async.task_execution_state(t) = 'READY'
-      AND t.concurrency_pool = (SELECT self_target FROM async.control)
+CREATE OR REPLACE FUNCTION async.push_internal_query(
+  _query TEXT) RETURNS BIGINT AS
+$$
+  SELECT async.push_task(
+    (
+      NULL,
+      self_target,
+      -99,
+      _query,
+      NULL,
+      NULL,
+      NULL
+    )::async.task_push_t,
+    _source := 'async.internal_query')
+  FROM async.control;
+$$ LANGUAGE SQL;
+  
 
-  )
+CREATE OR REPLACE VIEW async.v_run_internal AS
   SELECT 
     array_agg(task_id) AS task_ids, 
     status,
@@ -1746,9 +1764,21 @@ CREATE OR REPLACE VIEW async.v_run_internal AS
       WHERE 
         async.task_execution_state(t) = 'READY'
         AND t.concurrency_pool = (SELECT self_target FROM async.control)
+        AND source = 'async.finish'
     ) q
   )
   GROUP BY 2, 3, 4;
+
+CREATE OR REPLACE VIEW async.v_internal_query AS
+  SELECT 
+    task_id,
+    query
+  FROM async.task_running t
+  WHERE 
+    async.task_execution_state(t) = 'READY'
+    AND t.concurrency_pool = (SELECT self_target FROM async.control)
+    AND source = 'async.internal_query';
+
 
 CREATE OR REPLACE FUNCTION async.run_internal() RETURNS BOOL AS
 $$
@@ -1774,12 +1804,58 @@ BEGIN
     _did_stuff := true;
   END LOOP;
 
+  FOR r IN SELECT * FROM async.v_internal_query
+  LOOP
+    PERFORM async.log(format('Running internal query: %s', r.query));
+
+    BEGIN
+      EXECUTE r.query;
+    EXCEPTION WHEN OTHERS THEN
+      UPDATE async.task SET 
+        consumed = now(),
+        processed = now(),
+        failed = true,
+        processing_error = SQLERRM
+      WHERE task_id = r.task_id;
+
+      PERFORM async.log(
+        'WARNING',
+        format(
+          'internal query: %s failed with %s', 
+          r.query,
+          SQLERRM));
+    END;
+
+    UPDATE async.task SET 
+      consumed = now(),
+      processed = now()
+    WHERE task_id = r.task_id;
+
+    _did_stuff := true;
+  END LOOP;
+
   /* XXX: handle non finished tasks (with partial index supporting) */
   RETURN _did_stuff;
 END;
 $$ LANGUAGE PLPGSQL;
 
-CREATE OR REPLACE PROCEDURE async.do_work(did_work INOUT BOOL DEFAULT NULL) AS
+CREATE OR REPLACE FUNCTION async.format_timing(i INTERVAL) RETURNS TEXT AS
+$$
+  SELECT 
+    CASE WHEN e > 99999999
+      THEN '********'
+      ELSE lpad(e::TEXT, 8)
+    END
+  FROM 
+  (
+    SELECT (extract('epoch' FROM i) * 1000000)::BIGINT e
+  );
+$$ LANGUAGE SQL IMMUTABLE;
+
+CREATE OR REPLACE PROCEDURE async.do_work(
+  did_work INOUT BOOL,
+  _print_stats BOOL,
+  _print_stats_period FLOAT8) AS
 $$
 DECLARE
   _when TIMESTAMPTZ;
@@ -1796,45 +1872,64 @@ DECLARE
   _did_internal BOOL;
   _did_run BOOL;
   _did_reap BOOL;
+
+  _tasks_run INT;
 BEGIN
-  _commit_start := now();
 
-  _when := clock_timestamp();
-
-  _work_start := _when;
-  _did_internal := async.run_internal();
-  _internal_time := clock_timestamp() - _when;
-
-  _when := clock_timestamp();
-  _did_reap := async.reap_tasks();
-  _reap_time := clock_timestamp() - _when;    
-
-  _when := clock_timestamp();
-  _did_run := async.run_tasks();
-  did_work := _did_internal OR _did_run OR _did_reap;
-  _run_time := clock_timestamp() - _when;
-
-  _when := clock_timestamp();
-  CALL async.run_routines('LOOP');
-  _finish_time := clock_timestamp();
-  _routine_time := _finish_time - _when;
-
-  _total_time := _finish_time - _work_start;
-  _since_commit := _finish_time - _commit_start;
-
-  IF did_work
+  IF _print_stats
   THEN
-    PERFORM async.log(
-      'DEBUG',
-      format(
-        'timing: total: %s since commit: %s reap: %s internal: %s run: %s routine: %s', 
-        _total_time,
-        _finish_time - now(),
-        _reap_time, 
-        _internal_time, 
-        _run_time, 
-        _routine_time));
+    _commit_start := now();
+    _when := clock_timestamp();
+    _work_start := _when;
+
+    ANALYZE async.task_running;
+
+    _when := clock_timestamp();
+    _did_internal := async.run_internal();
+    _internal_time := clock_timestamp() - _when;
+
+    _when := clock_timestamp();
+    _did_reap := async.reap_tasks();
+    _reap_time := clock_timestamp() - _when;    
+
+    _when := clock_timestamp();
+    _did_run := async.run_tasks();
+    _run_time := clock_timestamp() - _when;
+
+    _when := clock_timestamp();
+    CALL async.run_routines('LOOP');
+    _finish_time := clock_timestamp();
+    _routine_time := _finish_time - _when;
+
+    _total_time := _finish_time - _work_start;
+    _since_commit := _finish_time - _commit_start;    
+
+    SELECT INTO _tasks_run last_value - CASE WHEN is_called THEN 0 ELSE 1 END
+    FROM task_counter;
+
+    IF _tasks_run > 0 OR did_work
+    THEN
+      PERFORM async.log(
+        format(
+          'tasks/sec: %s timing (us) total: %s non work: %s reap: %s internal: %s run: %s routine: %s', 
+          lpad(((_tasks_run / NULLIF(_print_stats_period, 0))::INT)::TEXT, 6),
+          async.format_timing(_total_time),
+          async.format_timing((_finish_time - _commit_start) - _total_time),
+          async.format_timing(_reap_time), 
+          async.format_timing(_internal_time), 
+          async.format_timing(_run_time), 
+          async.format_timing(_routine_time)));
+
+      PERFORM setval('task_counter', 1, false);
+    END IF;
+  ELSE
+    _did_internal := async.run_internal();
+    _did_reap := async.reap_tasks();
+    _did_run := async.run_tasks();
+    CALL async.run_routines('LOOP');  
   END IF;
+
+  did_work := _did_internal OR _did_run OR _did_reap;
 
 EXCEPTION
   WHEN OTHERS THEN 
@@ -1972,20 +2067,32 @@ $$ LANGUAGE PLPGSQL;
 
 CREATE OR REPLACE PROCEDURE async.cycle(
   _last_did_stuff INOUT TIMESTAMPTZ DEFAULT NULL,
-  _show_message INOUT BOOL DEFAULT NULL) AS
+  _show_message INOUT BOOL DEFAULT NULL,
+  _last_printed_stats INOUT TIMESTAMPTZ DEFAULT now(),
+  _exit INOUT BOOL DEFAULT false) AS
 $$
 DECLARE
   g async.control;
 
   _did_stuff BOOL DEFAULT FALSE;
 
-  _back_off INTERVAL DEFAULT '30 seconds';  
+  _back_off INTERVAL DEFAULT '30 seconds';
+  _stats_output_frequency INTERVAL DEFAULT '5 seconds';
+  _print_stats BOOL DEFAULT false;
+  _print_stats_period FLOAT8;
 BEGIN
   SELECT INTO g * FROM async.control;
 
   IF NOT g.Paused
   THEN
-    CALL async.do_work(_did_stuff);
+    IF now() - _last_printed_stats > _stats_output_frequency
+    THEN
+      _print_stats := true;
+      _print_stats_period := extract('epoch' FROM  now() - _last_printed_stats);
+      _last_printed_stats := now();
+    END IF;
+
+    CALL async.do_work(_did_stuff, _print_stats, _print_stats_period);
     PERFORM async.clear_latches();
 
     IF _last_did_stuff IS NULL
@@ -1997,18 +2104,26 @@ BEGIN
   /* flush transaction state */
   COMMIT;
 
+  IF NOT g.enabled
+  THEN
+    _exit := true;
+    UPDATE async.control SET enabled = true;
+    RETURN;
+  END IF;    
+
+
   CALL async.maintenance(_did_stuff);
 
   IF _did_stuff
   THEN
-    _show_message := true;
-    _last_did_stuff := clock_timestamp();
-  ELSE
-    IF NOT g.enabled
+    IF NOT _show_message
     THEN
-      RETURN;
-    END IF;    
+      PERFORM async.log('Got work!');
+      _show_message := true;
+    END IF;
 
+    _last_did_stuff := now();
+  ELSE
     /* wait a little bit before showing message */      
     IF _show_message OR g.paused
     THEN
@@ -2025,15 +2140,40 @@ BEGIN
           PERFORM async.log('Nothing to do. sleeping...');
         END IF;
       END IF;
-
       PERFORM pg_sleep(g.busy_sleep);
-    ELSE
+    ELSE   
       PERFORM pg_sleep(g.idle_sleep);  
     END IF;
   END IF;
 END;
 $$ LANGUAGE PLPGSQL;
 
+CREATE OR REPLACE PROCEDURE async.main_loop(
+  _manual_mode BOOL DEFAULT false) AS
+$$
+DECLARE
+  _last_did_stuff TIMESTAMPTZ DEFAULT now();
+  _show_message BOOL DEFAULT true;
+  _last_printed_stats TIMESTAMPTZ DEFAULT now();
+  _exit BOOL DEFAULT false;
+BEGIN
+  IF NOT _manual_mode
+  THEN
+    LOOP
+      CALL async.cycle(
+        _last_did_stuff, 
+        _show_message, 
+        _last_printed_stats, 
+        _exit);
+      EXIT WHEN _exit;
+    END LOOP;  
+  END IF;
+
+  PERFORM async.log(
+    'Entering manual mode (CALL async.cycle() to iterate, '
+    'CALL async.main_loop() to resume)');  
+END;
+$$ LANGUAGE PLPGSQL;
 
 CREATE OR REPLACE PROCEDURE async.main(
   _force BOOL DEFAULT false,
@@ -2043,9 +2183,6 @@ DECLARE
   g async.control;
 
   _acquired BOOL;
-  _last_did_stuff TIMESTAMPTZ DEFAULT now();
-  _show_message BOOL DEFAULT true;
-
   _routine TEXT;
 BEGIN
   SELECT INTO g * FROM async.control;
@@ -2113,7 +2250,9 @@ BEGIN
   /* clear any oustanding latches */
   DELETE FROM async.request_latch;
 
-  /* clear out any tasks that may have been left in running state */
+  /* clear out any tasks that may have been left in running state arm-wrestling
+   * with the query planner while doing do
+   */
   SET LOCAL enable_seqscan TO false;
   SET LOCAL enable_bitmapscan TO false;
 
@@ -2132,6 +2271,10 @@ BEGIN
   /* run startup routines for user supplied cleanup */
   CALL async.run_routines('STARTUP');
 
+  /* keep track of tasks run */
+  CREATE TEMP SEQUENCE IF NOT EXISTS task_counter;
+  PERFORM setval('task_counter', 1, false);
+
   /* reset worker table with a startup flag here so that the initialization to 
    * extend at runtime if needed.
    */
@@ -2144,15 +2287,8 @@ BEGIN
 
   PERFORM async.log('Initialization of query processor complete');    
 
-  IF _manual_mode
-  THEN
-    PERFORM async.log('Entering manual mode (CALL async.cycle() to iterate)');    
-    RETURN;
-  END IF;
-
-  LOOP
-    CALL async.cycle(_last_did_stuff, _show_message);
-  END LOOP;  
+  /* eneter processing */
+  CALL async.main_loop(_manual_mode);
 END;
 $$ LANGUAGE PLPGSQL;
 
