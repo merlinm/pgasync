@@ -473,9 +473,10 @@ BEGIN
     RETURN QUERY SELECT * FROM dblink(
       async.server(), 
       format(
-        'SELECT * FROM async.get_tasks(%s, %s)',
+        'SELECT * FROM async.get_tasks(%s, %s, %s)',
         quote_literal($1),
-        quote_literal($2))) AS R(
+        quote_literal($2),
+        quote_literal($3))) AS R(
           task_id BIGINT,
           priorty INT,
           times_up TIMESTAMPTZ,
@@ -484,7 +485,10 @@ BEGIN
     RETURN;
   END IF;
 
-  RETURN QUERY SELECT * FROM async.get_tasks_internal(_target, _limit);
+  RETURN QUERY SELECT * FROM async.get_tasks_internal(
+    _target, 
+    _limit, 
+    _timeout);
 END;
 $$ LANGUAGE PLPGSQL;
 
