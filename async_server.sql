@@ -341,6 +341,28 @@ CREATE OR REPLACE VIEW async.v_target_status AS
   GROUP BY target, cp.concurrency_pool, cpt.concurrency_pool
   ORDER BY target;
 
+/* verify all connection strings */
+CREATE OR REPLACE FUNCTION async.test_connections() RETURNS VOID AS
+$$
+DECLARE
+  t RECORD;
+BEGIN
+  PERFORM async.log('DEBUG', 'Testing self_connection_string');
+  PERFORM * FROM dblink(
+    (SELECT self_connection_string FROM async.control),
+    'SELECT 0') AS R(V INT);
+
+  FOR t IN SELECT * FROM async.target
+  LOOP
+    PERFORM async.log('DEBUG', 'Testing target ' || t.target);
+    PERFORM * FROM dblink(
+      (SELECT t.connection_string),
+      'SELECT 0') AS R(V INT);
+  END LOOP;
+
+END;
+$$ LANGUAGE PLPGSQL;
+
 
 /* set up the table that manages tracking of threads in flight. Also set
  * up the concurrency pool tracker.   There is no requirement for pools to be
@@ -2123,6 +2145,9 @@ BEGIN
     NULL,
     false)
   ON CONFLICT DO NOTHING;
+
+  PERFORM async.log('Testing connections');
+  PERFORM async.test_connections();
   
   /* run maintenance now as a precaution */
   CALL async.maintenance(true);

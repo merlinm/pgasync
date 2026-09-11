@@ -3,12 +3,9 @@ DO
 $bootstrap$
 BEGIN
 
-PERFORM 1 FROM pg_extension WHERE extname = 'dblink';
+CREATE EXTENSION IF NOT EXISTS dblink;
 
-IF NOT FOUND 
-THEN 
-  RAISE EXCEPTION 'dblink extension must be installed before installing async';
-END IF;
+PERFORM 1 FROM pg_extension WHERE extname = 'dblink';
 
 BEGIN
   PERFORM 1 FROM async.client_control;
